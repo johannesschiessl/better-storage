@@ -1,155 +1,195 @@
-import {
-  actionGeneric,
-  httpActionGeneric,
-  mutationGeneric,
-  queryGeneric,
-} from "convex/server";
-import type {
-  Auth,
-  GenericActionCtx,
-  GenericDataModel,
-  HttpRouter,
-} from "convex/server";
-import { v } from "convex/values";
+import { httpActionGeneric, type FunctionReference } from "convex/server";
+import type { GenericDataModel, HttpRouter } from "convex/server";
 import type { ComponentApi } from "../component/_generated/component.js";
+import type { Doc, Id } from "../component/_generated/dataModel.js";
+import type { MutationCtx, QueryCtx } from "../component/_generated/server.js";
 
-// See the example/convex/example.ts file for how to use this component.
-
-/**
- *
- * @param ctx
- * @param targetId
- */
-export function translate(
-  ctx: ActionCtx,
-  component: ComponentApi,
-  commentId: string,
-) {
-  // By wrapping the function call, we can read from environment variables.
-  const baseUrl = getDefaultBaseUrlUsingEnv();
-  return ctx.runAction(component.lib.translate, { commentId, baseUrl });
+function getAllowedOrigin(request: Request) {
+  return request.headers.get("Origin") ?? process.env.SITE_URL ?? "*"; // TODO: make this actually secure...
 }
 
-/**
- * For re-exporting of an API accessible from React clients.
- * e.g. `export const { list, add, translate } =
- * exposeApi(components.sampleComponent, {
- *   auth: async (ctx, operation) => { ... },
- * });`
- * See example/convex/example.ts.
- */
-export function exposeApi(
-  component: ComponentApi,
-  options: {
-    /**
-     * It's very important to authenticate any functions that users will export.
-     * This function should return the authorized user's ID.
-     */
-    auth: (
-      ctx: { auth: Auth },
-      operation:
-        | { type: "read"; targetId: string }
-        | { type: "create"; targetId: string }
-        | { type: "update"; commentId: string },
-    ) => Promise<string>;
-    baseUrl?: string;
-  },
-) {
-  const baseUrl = options.baseUrl ?? getDefaultBaseUrlUsingEnv();
-  return {
-    list: queryGeneric({
-      args: { targetId: v.string() },
-      handler: async (ctx, args) => {
-        await options.auth(ctx, { type: "read", targetId: args.targetId });
-        return await ctx.runQuery(component.lib.list, {
-          targetId: args.targetId,
-        });
-      },
-    }),
-    add: mutationGeneric({
-      args: { text: v.string(), targetId: v.string() },
-      handler: async (ctx, args) => {
-        const userId = await options.auth(ctx, {
-          type: "create",
-          targetId: args.targetId,
-        });
-        return await ctx.runMutation(component.lib.add, {
-          text: args.text,
-          userId: userId,
-          targetId: args.targetId,
-        });
-      },
-    }),
-    translate: actionGeneric({
-      args: { commentId: v.string() },
-      handler: async (ctx, args) => {
-        await options.auth(ctx, {
-          type: "update",
-          commentId: args.commentId,
-        });
-        return await ctx.runAction(component.lib.translate, {
-          commentId: args.commentId,
-          baseUrl,
-        });
-      },
-    }),
+function buildCorsHeaders(request: Request) {
+  const origin = getAllowedOrigin(request);
+  const headers: Record<string, string> = {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": "POST",
+    "Access-Control-Allow-Headers": "Content-Type, Digest, Authorization",
+    "Access-Control-Max-Age": "86400",
+    Vary: "origin",
   };
+  if (origin !== "*") {
+    headers["Access-Control-Allow-Credentials"] = "true";
+  }
+  return headers;
 }
 
-/**
- * Register HTTP routes for the component.
- * This allows you to expose HTTP endpoints for the component.
- * See example/convex/http.ts for an example.
- */
+interface UploadRoute {
+  name: string;
+  allowedMimeTypes: string[];
+  maxFileSize: number;
+  maxFileCount: number;
+  minFileCount: number;
+  //checkUpload: FunctionReference<"mutation", "internal", { request: FormData }>;
+  //onUploaded: FunctionReference<"mutation", "internal", { request: FormData, storageIdsAndUrls: { id: Id<"_storage">, url: string }[], metadata: Record<string, any> }>;
+}
+interface registerRoutesProps {
+  pathPrefix?: string;
+  routes: UploadRoute[];
+}
+
 export function registerRoutes(
   http: HttpRouter,
   component: ComponentApi,
-  { pathPrefix = "/comments" }: { pathPrefix?: string } = {},
+  { pathPrefix = "/storage", routes }: registerRoutesProps,
 ) {
-  http.route({
-    path: `${pathPrefix}/last`,
-    method: "GET",
-    // Note we use httpActionGeneric here because it will be registered in
-    // the app's http.ts file, which has a different type than our `httpAction`.
-    handler: httpActionGeneric(async (ctx, request) => {
-      const targetId = new URL(request.url).searchParams.get("targetId");
-      if (!targetId) {
-        return new Response(
-          JSON.stringify({ error: "targetId parameter required" }),
-          {
+  for (const route of routes) {
+    http.route({
+      path: `${pathPrefix}/${route.name}/upload`,
+      method: "POST",
+      handler: httpActionGeneric(async (ctx, request) => {
+        const formData = await request.formData();
+        const files = formData
+          .getAll("files")
+          .filter(
+            (value): value is File => value instanceof File && value.size > 0,
+          );
+
+        if (files.length === 0) {
+          return new Response(JSON.stringify({ error: "No files uploaded" }), {
             status: 400,
-            headers: {
-              "Content-Type": "application/json",
-            },
-          },
+          });
+        }
+
+        if (files.length > route.maxFileCount) {
+          return new Response(
+            JSON.stringify({ error: "Too many files uploaded" }),
+            { status: 400 },
+          );
+        }
+
+        if (files.length < route.minFileCount) {
+          return new Response(
+            JSON.stringify({ error: "Too few files uploaded" }),
+            { status: 400 },
+          );
+        }
+
+        for (const file of files) {
+          if (!route.allowedMimeTypes.includes(file.type)) {
+            return new Response(
+              JSON.stringify({ error: "Invalid file type" }),
+              { status: 400 },
+            );
+          }
+
+          if (file.size > route.maxFileSize) {
+            return new Response(JSON.stringify({ error: "File too large" }), {
+              status: 400,
+            });
+          }
+        }
+
+        const requestWithoutFiles = new FormData();
+        for (const [key, value] of formData.entries()) {
+          if (key !== route.name) {
+            requestWithoutFiles.append(key, value);
+          }
+        }
+
+        const metadata = {};
+
+        //const metadata = await ctx.runMutation(route.checkUpload, { request: requestWithoutFiles });
+
+        const storageIdsAndUrls = await Promise.all(
+          files.map(async (file) => {
+            const storageId = await ctx.storage.store(file);
+            const storageUrl = await ctx.storage.getUrl(storageId);
+
+            if (!storageUrl) {
+              throw new Error("Failed to get URL for uploaded file"); // TODO: return response with error
+            }
+
+            return { id: storageId, url: storageUrl };
+          }),
         );
-      }
-      const comments = await ctx.runQuery(component.lib.list, {
-        targetId,
-      });
-      const lastComment = comments[0] ?? null;
-      return new Response(JSON.stringify(lastComment), {
-        status: 200,
-        headers: {
-          "Content-Type": "application/json",
-        },
-      });
-    }),
-  });
+
+        await ctx.runMutation(component.lib.createFilesMetadata, {
+          storageIdsAndUrls,
+          metadata,
+          bucket: route.name,
+        });
+
+        const result = null;
+
+        // const result = await ctx.runMutation(route.onUploaded, { request: requestWithoutFiles, storageIdsAndUrls, metadata });
+
+        return new Response(
+          result
+            ? JSON.stringify(result)
+            : "File(s) uploaded successfully",
+          { status: 200 },
+        );
+      }),
+    });
+
+    http.route({
+      path: `${pathPrefix}/${route.name}/upload`,
+      method: "OPTIONS",
+      handler: httpActionGeneric(async (_, request) => {
+        const headers = request.headers;
+        if (
+          headers.get("Origin") !== null &&
+          headers.get("Access-Control-Request-Method") !== null &&
+          headers.get("Access-Control-Request-Headers") !== null
+        ) {
+          return new Response(null, {
+            headers: new Headers(buildCorsHeaders(request)),
+          });
+        } else {
+          return new Response();
+        }
+      }),
+    });
+  }
 }
 
-function getDefaultBaseUrlUsingEnv() {
-  return process.env.BASE_URL ?? "https://pirate.monkeyness.com";
-}
-
-// Convenient types for `ctx` args, that only include the bare minimum.
-
-// type QueryCtx = Pick<GenericQueryCtx<GenericDataModel>, "runQuery">;
-// type MutationCtx = Pick<
-//   GenericMutationCtx<GenericDataModel>,
-//   "runQuery" | "runMutation"
-// >;
-type ActionCtx = Pick<
-  GenericActionCtx<GenericDataModel>,
-  "runQuery" | "runMutation" | "runAction"
->;
+export const createClient = (component: ComponentApi) => {
+  return {
+    async getFile(
+      ctx: QueryCtx,
+      fileId: Id<"files">,
+    ): Promise<Doc<"files"> | null> {
+      return await ctx.runQuery(component.lib.getFilesMetadata, {
+        fileIds: [fileId],
+      });
+    },
+    async listFiles(
+      ctx: QueryCtx,
+      fileIds: Id<"files">[],
+    ): Promise<Doc<"files">[]> {
+      return await ctx.runQuery(component.lib.getFilesMetadata, { fileIds });
+    },
+    async deleteFile(ctx: MutationCtx, fileId: Id<"files">): Promise<void> {
+      const file = await ctx.runQuery(component.lib.getFilesMetadata, {
+        fileIds: [fileId],
+      });
+      await ctx.storage.delete(file.storageId as Id<"_storage">);
+      return await ctx.runMutation(component.lib.deleteFilesMetadata, {
+        fileIds: [fileId],
+      });
+    },
+    async deleteFiles(ctx: MutationCtx, fileIds: Id<"files">[]): Promise<void> {
+      const files = await ctx.runQuery(component.lib.getFilesMetadata, {
+        fileIds,
+      });
+      await Promise.all(
+        files.map(async (file: Doc<"files">) => {
+          await ctx.storage.delete(file.storageId as Id<"_storage">);
+        }),
+      );
+      return await ctx.runMutation(component.lib.deleteFilesMetadata, {
+        fileIds,
+      });
+    },
+  };
+};
