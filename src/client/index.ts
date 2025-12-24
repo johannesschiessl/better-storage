@@ -1,8 +1,13 @@
-import { httpActionGeneric, type FunctionReference } from "convex/server";
-import type { GenericDataModel, HttpRouter } from "convex/server";
+import {
+  httpActionGeneric,
+  internalMutationGeneric,
+  type FunctionReference,
+} from "convex/server";
+import type { HttpRouter } from "convex/server";
 import type { ComponentApi } from "../component/_generated/component.js";
 import type { Doc, Id } from "../component/_generated/dataModel.js";
 import type { MutationCtx, QueryCtx } from "../component/_generated/server.js";
+import { v } from "convex/values";
 
 function getAllowedOrigin(request: Request) {
   return request.headers.get("Origin") ?? process.env.SITE_URL ?? "*"; // TODO: make this actually secure...
@@ -29,18 +34,152 @@ interface UploadRoute {
   maxFileSize: number;
   maxFileCount: number;
   minFileCount: number;
-  //checkUpload: FunctionReference<"mutation", "internal", { request: FormData }>;
-  //onUploaded: FunctionReference<"mutation", "internal", { request: FormData, storageIdsAndUrls: { id: Id<"_storage">, url: string }[], metadata: Record<string, any> }>;
 }
-interface registerRoutesProps {
+type FormValue = FormDataEntryValue;
+type NormalizedFormData = Record<string, string | string[]>;
+type StorageIdAndUrl = { id: Id<"_storage">; url: string };
+
+export type UploadRouteWithCallbacks<
+  Metadata extends Record<string, unknown> = Record<string, unknown>,
+  UploadResult = unknown,
+> = UploadRoute & {
+  checkUpload?: (
+    ctx: MutationCtx,
+    request: NormalizedFormData,
+  ) => Promise<Metadata> | Metadata;
+  onUploaded?: (
+    ctx: MutationCtx,
+    args: {
+      request: NormalizedFormData;
+      storageIdsAndUrls: StorageIdAndUrl[];
+      metadata: Metadata;
+    },
+  ) => Promise<UploadResult> | UploadResult;
+};
+
+type RouteNames<Routes extends readonly UploadRouteWithCallbacks[]> =
+  Routes[number]["name"];
+
+type UploadCheckArgs<Routes extends readonly UploadRouteWithCallbacks[]> = {
+  route: RouteNames<Routes>;
+  request: NormalizedFormData;
+};
+
+type UploadOnUploadedArgs<Routes extends readonly UploadRouteWithCallbacks[]> =
+  UploadCheckArgs<Routes> & {
+    storageIdsAndUrls: StorageIdAndUrl[];
+    metadata: Record<string, unknown>;
+  };
+
+type UploadMutations<Routes extends readonly UploadRouteWithCallbacks[]> = {
+  checkUpload: FunctionReference<
+    "mutation",
+    "internal",
+    UploadCheckArgs<Routes>,
+    Record<string, unknown>
+  >;
+  onUploaded: FunctionReference<
+    "mutation",
+    "internal",
+    UploadOnUploadedArgs<Routes>,
+    unknown
+  >;
+};
+
+interface RegisterRoutesProps<Routes extends readonly UploadRouteWithCallbacks[]> {
   pathPrefix?: string;
-  routes: UploadRoute[];
+  routes: Routes;
+  uploads?: UploadMutations<Routes>;
 }
 
-export function registerRoutes(
+function isFile(value: FormValue): value is File {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "size" in value &&
+    "type" in value &&
+    "arrayBuffer" in value
+  );
+}
+
+function normalizeFormData(formData: FormData): NormalizedFormData {
+  const request: NormalizedFormData = {};
+
+  for (const [key, value] of formData.entries()) {
+    if (isFile(value)) {
+      continue;
+    }
+    if (request[key] === undefined) {
+      request[key] = value;
+    } else {
+      const current = request[key];
+      request[key] = Array.isArray(current) ? [...current, value] : [current, value];
+    }
+  }
+
+  return request;
+}
+
+export function createUploadMutations<
+  const Routes extends readonly UploadRouteWithCallbacks[],
+>(routes: Routes) {
+  const routesByName = new Map(routes.map((route) => [route.name, route]));
+
+  const checkUpload = internalMutationGeneric({
+    args: {
+      route: v.string(),
+      request: v.record(v.string(), v.union(v.string(), v.array(v.string()))),
+    },
+    handler: async (ctx, args) => {
+      const route = routesByName.get(args.route);
+      if (!route) {
+        throw new Error(`Unknown route "${args.route}"`);
+      }
+      if (!route.checkUpload) {
+        return {};
+      }
+      return await route.checkUpload(ctx as MutationCtx, args.request);
+    },
+  });
+
+  const onUploaded = internalMutationGeneric({
+    args: {
+      route: v.string(),
+      request: v.record(v.string(), v.union(v.string(), v.array(v.string()))),
+      storageIdsAndUrls: v.array(
+        v.object({ id: v.id("_storage"), url: v.string() }),
+      ),
+      metadata: v.any(),
+    },
+    handler: async (ctx, args) => {
+      const route = routesByName.get(args.route);
+      if (!route) {
+        throw new Error(`Unknown route "${args.route}"`);
+      }
+      if (!route.onUploaded) {
+        return null;
+      }
+      return await route.onUploaded(ctx as MutationCtx, {
+        request: args.request,
+        storageIdsAndUrls: args.storageIdsAndUrls as StorageIdAndUrl[],
+        metadata: args.metadata as Record<string, unknown>,
+      });
+    },
+  });
+
+  return { checkUpload, onUploaded };
+}
+
+export function registerRoutes<
+  const Routes extends readonly UploadRouteWithCallbacks[],
+>(
   http: HttpRouter,
   component: ComponentApi,
-  { pathPrefix = "/storage", routes }: registerRoutesProps,
+  {
+    pathPrefix = "/storage",
+    routes,
+    uploads,
+  }: RegisterRoutesProps<Routes>,
 ) {
   for (const route of routes) {
     http.route({
@@ -50,9 +189,7 @@ export function registerRoutes(
         const formData = await request.formData();
         const files = formData
           .getAll("files")
-          .filter(
-            (value): value is File => value instanceof File && value.size > 0,
-          );
+          .filter((value): value is File => isFile(value) && value.size > 0);
 
         if (files.length === 0) {
           return new Response(JSON.stringify({ error: "No files uploaded" }), {
@@ -89,16 +226,15 @@ export function registerRoutes(
           }
         }
 
-        const requestWithoutFiles = new FormData();
-        for (const [key, value] of formData.entries()) {
-          if (key !== route.name) {
-            requestWithoutFiles.append(key, value);
-          }
-        }
+        const requestWithoutFiles = normalizeFormData(formData);
 
-        const metadata = {};
-
-        //const metadata = await ctx.runMutation(route.checkUpload, { request: requestWithoutFiles });
+        const metadata: Record<string, unknown> =
+          uploads && route.checkUpload
+            ? await ctx.runMutation(uploads.checkUpload, {
+                route: route.name,
+                request: requestWithoutFiles,
+              })
+            : {};
 
         const storageIdsAndUrls = await Promise.all(
           files.map(async (file) => {
@@ -119,9 +255,15 @@ export function registerRoutes(
           bucket: route.name,
         });
 
-        const result = null;
-
-        // const result = await ctx.runMutation(route.onUploaded, { request: requestWithoutFiles, storageIdsAndUrls, metadata });
+        const result =
+          uploads && route.onUploaded
+            ? await ctx.runMutation(uploads.onUploaded, {
+                route: route.name,
+                request: requestWithoutFiles,
+                storageIdsAndUrls,
+                metadata,
+              })
+            : null;
 
         return new Response(
           result
