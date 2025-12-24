@@ -112,7 +112,9 @@ function normalizeFormData(formData: FormData): NormalizedFormData {
       request[key] = value;
     } else {
       const current = request[key];
-      request[key] = Array.isArray(current) ? [...current, value] : [current, value];
+      request[key] = Array.isArray(current)
+        ? [...current, value]
+        : [current, value];
     }
   }
 
@@ -127,9 +129,9 @@ function isMimeAllowed(fileType: string, allowedTypes: string[]) {
   );
 }
 
-export function createUploadMutations<
-  const Routes extends UploadRoutes,
->(routes: Routes) {
+export function createUploadMutations<const Routes extends UploadRoutes>(
+  routes: Routes,
+) {
   const routesByName = new Map(Object.entries(routes));
 
   const checkUpload = internalMutationGeneric({
@@ -180,11 +182,7 @@ export function createUploadMutations<
 export function registerRoutes<const Routes extends UploadRoutes>(
   http: HttpRouter,
   component: ComponentApi,
-  {
-    pathPrefix = "/storage",
-    routes,
-    uploads,
-  }: RegisterRoutesProps<Routes>,
+  { pathPrefix = "/storage", routes, uploads }: RegisterRoutesProps<Routes>,
 ) {
   for (const routeName of Object.keys(routes) as RouteNames<Routes>[]) {
     const route = routes[routeName];
@@ -265,9 +263,7 @@ export function registerRoutes<const Routes extends UploadRoutes>(
             : null;
 
         return new Response(
-          result
-            ? JSON.stringify(result)
-            : "File(s) uploaded successfully",
+          result ? JSON.stringify(result) : "File(s) uploaded successfully",
           { status: 200 },
         );
       }),
