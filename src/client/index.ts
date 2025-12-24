@@ -28,21 +28,13 @@ function buildCorsHeaders(request: Request) {
   return headers;
 }
 
-interface UploadRoute {
-  name: string;
-  allowedMimeTypes: string[];
-  maxFileSize: number;
-  maxFileCount: number;
-  minFileCount: number;
-}
-type FormValue = FormDataEntryValue;
-type NormalizedFormData = Record<string, string | string[]>;
-type StorageIdAndUrl = { id: Id<"_storage">; url: string };
-
-export type UploadRouteWithCallbacks<
+type UploadRouteConfig<
   Metadata extends Record<string, unknown> = Record<string, unknown>,
   UploadResult = unknown,
-> = UploadRoute & {
+> = {
+  fileTypes: string[];
+  maxFileSize: number;
+  maxFileCount: number;
   checkUpload?: (
     ctx: MutationCtx,
     request: NormalizedFormData,
@@ -56,22 +48,29 @@ export type UploadRouteWithCallbacks<
     },
   ) => Promise<UploadResult> | UploadResult;
 };
+type FormValue = FormDataEntryValue;
+type NormalizedFormData = Record<string, string | string[]>;
+type StorageIdAndUrl = { id: Id<"_storage">; url: string };
 
-type RouteNames<Routes extends readonly UploadRouteWithCallbacks[]> =
-  Routes[number]["name"];
+export type UploadRoutes<
+  Metadata extends Record<string, unknown> = Record<string, unknown>,
+  UploadResult = unknown,
+> = Record<string, UploadRouteConfig<Metadata, UploadResult>>;
 
-type UploadCheckArgs<Routes extends readonly UploadRouteWithCallbacks[]> = {
-  route: RouteNames<Routes>;
+type RouteNames<Routes extends UploadRoutes> = Extract<keyof Routes, string>;
+
+type UploadCheckArgs<Routes extends UploadRoutes> = {
+  route: RouteNames<Routes> | string;
   request: NormalizedFormData;
 };
 
-type UploadOnUploadedArgs<Routes extends readonly UploadRouteWithCallbacks[]> =
+type UploadOnUploadedArgs<Routes extends UploadRoutes> =
   UploadCheckArgs<Routes> & {
     storageIdsAndUrls: StorageIdAndUrl[];
     metadata: Record<string, unknown>;
   };
 
-type UploadMutations<Routes extends readonly UploadRouteWithCallbacks[]> = {
+type UploadMutations<Routes extends UploadRoutes> = {
   checkUpload: FunctionReference<
     "mutation",
     "internal",
@@ -86,7 +85,7 @@ type UploadMutations<Routes extends readonly UploadRouteWithCallbacks[]> = {
   >;
 };
 
-interface RegisterRoutesProps<Routes extends readonly UploadRouteWithCallbacks[]> {
+interface RegisterRoutesProps<Routes extends UploadRoutes> {
   pathPrefix?: string;
   routes: Routes;
   uploads?: UploadMutations<Routes>;
@@ -120,10 +119,18 @@ function normalizeFormData(formData: FormData): NormalizedFormData {
   return request;
 }
 
+function isMimeAllowed(fileType: string, allowedTypes: string[]) {
+  return allowedTypes.some((type) =>
+    type.endsWith("/*")
+      ? fileType.startsWith(type.slice(0, -1))
+      : type === fileType,
+  );
+}
+
 export function createUploadMutations<
-  const Routes extends readonly UploadRouteWithCallbacks[],
+  const Routes extends UploadRoutes,
 >(routes: Routes) {
-  const routesByName = new Map(routes.map((route) => [route.name, route]));
+  const routesByName = new Map(Object.entries(routes));
 
   const checkUpload = internalMutationGeneric({
     args: {
@@ -170,9 +177,7 @@ export function createUploadMutations<
   return { checkUpload, onUploaded };
 }
 
-export function registerRoutes<
-  const Routes extends readonly UploadRouteWithCallbacks[],
->(
+export function registerRoutes<const Routes extends UploadRoutes>(
   http: HttpRouter,
   component: ComponentApi,
   {
@@ -181,9 +186,10 @@ export function registerRoutes<
     uploads,
   }: RegisterRoutesProps<Routes>,
 ) {
-  for (const route of routes) {
+  for (const routeName of Object.keys(routes) as RouteNames<Routes>[]) {
+    const route = routes[routeName];
     http.route({
-      path: `${pathPrefix}/${route.name}/upload`,
+      path: `${pathPrefix}/${routeName}/upload`,
       method: "POST",
       handler: httpActionGeneric(async (ctx, request) => {
         const formData = await request.formData();
@@ -204,15 +210,8 @@ export function registerRoutes<
           );
         }
 
-        if (files.length < route.minFileCount) {
-          return new Response(
-            JSON.stringify({ error: "Too few files uploaded" }),
-            { status: 400 },
-          );
-        }
-
         for (const file of files) {
-          if (!route.allowedMimeTypes.includes(file.type)) {
+          if (!isMimeAllowed(file.type, route.fileTypes)) {
             return new Response(
               JSON.stringify({ error: "Invalid file type" }),
               { status: 400 },
@@ -231,7 +230,7 @@ export function registerRoutes<
         const metadata: Record<string, unknown> =
           uploads && route.checkUpload
             ? await ctx.runMutation(uploads.checkUpload, {
-                route: route.name,
+                route: routeName,
                 request: requestWithoutFiles,
               })
             : {};
@@ -252,13 +251,13 @@ export function registerRoutes<
         await ctx.runMutation(component.lib.createFilesMetadata, {
           storageIdsAndUrls,
           metadata,
-          bucket: route.name,
+          bucket: routeName,
         });
 
         const result =
           uploads && route.onUploaded
             ? await ctx.runMutation(uploads.onUploaded, {
-                route: route.name,
+                route: routeName,
                 request: requestWithoutFiles,
                 storageIdsAndUrls,
                 metadata,
@@ -275,7 +274,7 @@ export function registerRoutes<
     });
 
     http.route({
-      path: `${pathPrefix}/${route.name}/upload`,
+      path: `${pathPrefix}/${routeName}/upload`,
       method: "OPTIONS",
       handler: httpActionGeneric(async (_, request) => {
         const headers = request.headers;
