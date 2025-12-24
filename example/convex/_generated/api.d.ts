@@ -8,8 +8,8 @@
  * @module
  */
 
-import type * as example from "../example.js";
 import type * as http from "../http.js";
+import type * as storage from "../storage.js";
 
 import type {
   ApiFromModules,
@@ -18,8 +18,8 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
-  example: typeof example;
   http: typeof http;
+  storage: typeof storage;
 }>;
 
 /**
@@ -49,5 +49,5 @@ export declare const internal: FilterApi<
 >;
 
 export declare const components: {
-  sampleComponent: import("@example/sample-component/_generated/component.js").ComponentApi<"sampleComponent">;
+  storage: import("@example/sample-component/_generated/component.js").ComponentApi<"storage">;
 };

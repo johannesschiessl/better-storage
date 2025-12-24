@@ -24,31 +24,29 @@ import type { FunctionReference } from "convex/server";
 export type ComponentApi<Name extends string | undefined = string | undefined> =
   {
     lib: {
-      add: FunctionReference<
+      createFilesMetadata: FunctionReference<
         "mutation",
         "internal",
-        { targetId: string; text: string; userId: string },
-        string,
+        {
+          bucket: string;
+          metadata: Record<string, any>;
+          storageIdsAndUrls: Array<{ id: string; url: string }>;
+        },
+        any,
         Name
       >;
-      list: FunctionReference<
+      deleteFilesMetadata: FunctionReference<
+        "mutation",
+        "internal",
+        { fileIds: Array<string> },
+        any,
+        Name
+      >;
+      getFilesMetadata: FunctionReference<
         "query",
         "internal",
-        { limit?: number; targetId: string },
-        Array<{
-          _creationTime: number;
-          _id: string;
-          targetId: string;
-          text: string;
-          userId: string;
-        }>,
-        Name
-      >;
-      translate: FunctionReference<
-        "action",
-        "internal",
-        { baseUrl: string; commentId: string },
-        string,
+        { fileIds: Array<string> },
+        any,
         Name
       >;
     };

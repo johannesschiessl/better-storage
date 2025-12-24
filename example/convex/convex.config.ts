@@ -1,7 +1,7 @@
 import { defineApp } from "convex/server";
-import sampleComponent from "@example/sample-component/convex.config.js";
+import betterStorage from "@example/sample-component/convex.config.js";
 
 const app = defineApp();
-app.use(sampleComponent);
+app.use(betterStorage, { name: "storage" });
 
 export default app;
