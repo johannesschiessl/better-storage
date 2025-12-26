@@ -29,9 +29,7 @@ export const useUpload = (
     const res = await fetch(endpoint, {
       method: "POST",
       body: formData,
-      headers: {
-        Authorization: authToken ? `Bearer ${authToken}` : "",
-      },
+      headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
       signal,
       credentials: "omit",
     });
