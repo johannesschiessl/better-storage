@@ -1,13 +1,9 @@
 import { httpRouter } from "convex/server";
-import { registerRoutes } from "@example/sample-component";
-import { components, internal } from "./_generated/api";
-import { storageRoutes } from "./storage";
+import { internal } from "./_generated/api";
+import { storageComponent } from "./storage";
 
 const http = httpRouter();
 
-registerRoutes(http, components.storage, {
-  routes: storageRoutes,
-  uploads: internal.storage,
-});
+storageComponent.registerRoutes(http, { storageFunctions: internal.storage });
 
 export default http;

@@ -2,18 +2,86 @@ import {
   httpActionGeneric,
   internalMutationGeneric,
   type FunctionReference,
+  type HttpRouter,
 } from "convex/server";
-import type { HttpRouter } from "convex/server";
 import type { ComponentApi } from "../component/_generated/component.js";
 import type { Doc, Id } from "../component/_generated/dataModel.js";
 import type { MutationCtx, QueryCtx } from "../component/_generated/server.js";
 import { v } from "convex/values";
 
-function getAllowedOrigin(request: Request) {
-  return request.headers.get("Origin") ?? process.env.SITE_URL ?? "*"; // TODO: make this actually secure...
+type NormalizedFormData = Record<string, string | string[]>;
+type StorageIdAndUrl = { id: Id<"_storage">; url: string };
+
+/**
+ * Configuration for a single upload route.
+ * @template Metadata - The type returned by checkUpload and passed to onUploaded
+ * @template Result - The type returned by onUploaded
+ */
+export type UploadRouteConfig<
+  Metadata extends Record<string, unknown> = Record<string, unknown>,
+  Result = unknown,
+> = {
+  /** Allowed MIME types (supports wildcards like "image/*") */
+  fileTypes: string[];
+  /** Maximum file size in bytes */
+  maxFileSize: number;
+  /** Maximum number of files per upload */
+  maxFileCount?: number;
+  /**
+   * Called before upload to validate and prepare metadata.
+   * Return value is passed to onUploaded as `metadata`.
+   */
+  checkUpload?: (
+    ctx: MutationCtx,
+    request: NormalizedFormData,
+  ) => Promise<Metadata> | Metadata;
+  /**
+   * Called after files are successfully uploaded.
+   * Return value is sent back to the client.
+   */
+  onUploaded?: (
+    ctx: MutationCtx,
+    args: {
+      request: NormalizedFormData;
+      storageIdsAndUrls: StorageIdAndUrl[];
+      metadata: Metadata;
+    },
+  ) => Promise<Result> | Result;
+};
+
+/** A collection of named upload routes */
+export type UploadRoutes = Record<string, UploadRouteConfig<any, any>>;
+
+type UploadCheckArgs = {
+  route: string;
+  request: NormalizedFormData;
+};
+
+type UploadOnUploadedArgs = UploadCheckArgs & {
+  storageIdsAndUrls: StorageIdAndUrl[];
+  metadata: Record<string, unknown>;
+};
+
+type StorageFunctions = {
+  checkUpload: FunctionReference<
+    "mutation",
+    "internal",
+    UploadCheckArgs,
+    Record<string, unknown>
+  >;
+  onUploaded: FunctionReference<
+    "mutation",
+    "internal",
+    UploadOnUploadedArgs,
+    unknown
+  >;
+};
+
+function getAllowedOrigin(request: Request): string {
+  return request.headers.get("Origin") ?? process.env.SITE_URL ?? "*";
 }
 
-function buildCorsHeaders(request: Request) {
+function buildCorsHeaders(request: Request): Record<string, string> {
   const origin = getAllowedOrigin(request);
   const headers: Record<string, string> = {
     "Access-Control-Allow-Origin": origin,
@@ -28,70 +96,7 @@ function buildCorsHeaders(request: Request) {
   return headers;
 }
 
-type UploadRouteConfig<
-  Metadata extends Record<string, unknown> = Record<string, unknown>,
-  UploadResult = unknown,
-> = {
-  fileTypes: string[];
-  maxFileSize: number;
-  maxFileCount: number;
-  checkUpload?: (
-    ctx: MutationCtx,
-    request: NormalizedFormData,
-  ) => Promise<Metadata> | Metadata;
-  onUploaded?: (
-    ctx: MutationCtx,
-    args: {
-      request: NormalizedFormData;
-      storageIdsAndUrls: StorageIdAndUrl[];
-      metadata: Metadata;
-    },
-  ) => Promise<UploadResult> | UploadResult;
-};
-type FormValue = FormDataEntryValue;
-type NormalizedFormData = Record<string, string | string[]>;
-type StorageIdAndUrl = { id: Id<"_storage">; url: string };
-
-export type UploadRoutes<
-  Metadata extends Record<string, unknown> = Record<string, unknown>,
-  UploadResult = unknown,
-> = Record<string, UploadRouteConfig<Metadata, UploadResult>>;
-
-type RouteNames<Routes extends UploadRoutes> = Extract<keyof Routes, string>;
-
-type UploadCheckArgs<Routes extends UploadRoutes> = {
-  route: RouteNames<Routes> | string;
-  request: NormalizedFormData;
-};
-
-type UploadOnUploadedArgs<Routes extends UploadRoutes> =
-  UploadCheckArgs<Routes> & {
-    storageIdsAndUrls: StorageIdAndUrl[];
-    metadata: Record<string, unknown>;
-  };
-
-type UploadMutations<Routes extends UploadRoutes> = {
-  checkUpload: FunctionReference<
-    "mutation",
-    "internal",
-    UploadCheckArgs<Routes>,
-    Record<string, unknown>
-  >;
-  onUploaded: FunctionReference<
-    "mutation",
-    "internal",
-    UploadOnUploadedArgs<Routes>,
-    unknown
-  >;
-};
-
-interface RegisterRoutesProps<Routes extends UploadRoutes> {
-  pathPrefix?: string;
-  routes: Routes;
-  uploads?: UploadMutations<Routes>;
-}
-
-function isFile(value: FormValue): value is File {
+function isFile(value: FormDataEntryValue): value is File {
   return (
     typeof value === "object" &&
     value !== null &&
@@ -102,231 +107,388 @@ function isFile(value: FormValue): value is File {
 }
 
 function normalizeFormData(formData: FormData): NormalizedFormData {
-  const request: NormalizedFormData = {};
+  const result: NormalizedFormData = {};
 
   for (const [key, value] of formData.entries()) {
-    if (isFile(value)) {
-      continue;
-    }
-    if (request[key] === undefined) {
-      request[key] = value;
+    if (isFile(value)) continue;
+
+    const existing = result[key];
+    if (existing === undefined) {
+      result[key] = value;
+    } else if (Array.isArray(existing)) {
+      existing.push(value);
     } else {
-      const current = request[key];
-      request[key] = Array.isArray(current)
-        ? [...current, value]
-        : [current, value];
+      result[key] = [existing, value];
     }
   }
 
-  return request;
+  return result;
 }
 
-function isMimeAllowed(fileType: string, allowedTypes: string[]) {
-  return allowedTypes.some((type) =>
-    type.endsWith("/*")
-      ? fileType.startsWith(type.slice(0, -1))
-      : type === fileType,
-  );
+function isMimeTypeAllowed(fileType: string, allowedTypes: string[]): boolean {
+  return allowedTypes.some((allowedType) => {
+    if (allowedType.endsWith("/*")) {
+      const prefix = allowedType.slice(0, -1);
+      return fileType.startsWith(prefix);
+    }
+    return allowedType === fileType;
+  });
 }
 
-export function createUploadMutations<const Routes extends UploadRoutes>(
+function jsonResponse(
+  body: unknown,
+  status: number,
+  corsHeaders?: Record<string, string>,
+): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      ...corsHeaders,
+    },
+  });
+}
+
+function errorResponse(
+  error: string,
+  status: number,
+  corsHeaders?: Record<string, string>,
+): Response {
+  return jsonResponse({ error }, status, corsHeaders);
+}
+
+/**
+ * Helper function to define a route with full type inference.
+ * The return type of `checkUpload` automatically becomes the type of
+ * `metadata` in `onUploaded`.
+ *
+ * @example
+ * ```ts
+ * const routes = {
+ *   images: route({
+ *     fileTypes: ["image/*"],
+ *     maxFileSize: 5 * 1024 * 1024,
+ *     maxFileCount: 10,
+ *     checkUpload: async (ctx, request) => {
+ *       return { userId: "123" };
+ *     },
+ *     onUploaded: async (ctx, { metadata }) => {
+ *       // metadata is typed as { userId: string }
+ *       console.log(metadata.userId);
+ *     },
+ *   }),
+ * };
+ * ```
+ */
+export function route<
+  Metadata extends Record<string, unknown> = Record<string, unknown>,
+  Result = unknown,
+>(
+  config: UploadRouteConfig<Metadata, Result>,
+): UploadRouteConfig<Metadata, Result> {
+  return config;
+}
+
+/**
+ * Creates internal mutations for handling upload validation and post-upload processing.
+ * These mutations must be exported from your storage file.
+ */
+export function createStorageMutations<const Routes extends UploadRoutes>(
   routes: Routes,
 ) {
-  const routesByName = new Map(Object.entries(routes));
+  const routeMap = new Map(Object.entries(routes));
 
-  const checkUpload = internalMutationGeneric({
-    args: {
-      route: v.string(),
-      request: v.record(v.string(), v.union(v.string(), v.array(v.string()))),
-    },
-    handler: async (ctx, args) => {
-      const route = routesByName.get(args.route);
-      if (!route) {
-        throw new Error(`Unknown route "${args.route}"`);
-      }
-      if (!route.checkUpload) {
-        return {};
-      }
-      return await route.checkUpload(ctx as MutationCtx, args.request);
-    },
-  });
+  return {
+    checkUpload: internalMutationGeneric({
+      args: {
+        route: v.string(),
+        request: v.record(v.string(), v.union(v.string(), v.array(v.string()))),
+      },
+      handler: async (ctx, args): Promise<Record<string, unknown>> => {
+        const route = routeMap.get(args.route);
+        if (!route) {
+          throw new Error(`Unknown upload route: "${args.route}"`);
+        }
+        if (!route.checkUpload) {
+          return {};
+        }
+        return await route.checkUpload(ctx as MutationCtx, args.request);
+      },
+    }),
 
-  const onUploaded = internalMutationGeneric({
-    args: {
-      route: v.string(),
-      request: v.record(v.string(), v.union(v.string(), v.array(v.string()))),
-      storageIdsAndUrls: v.array(
-        v.object({ id: v.id("_storage"), url: v.string() }),
-      ),
-      metadata: v.any(),
-    },
-    handler: async (ctx, args) => {
-      const route = routesByName.get(args.route);
-      if (!route) {
-        throw new Error(`Unknown route "${args.route}"`);
-      }
-      if (!route.onUploaded) {
-        return null;
-      }
-      return await route.onUploaded(ctx as MutationCtx, {
-        request: args.request,
-        storageIdsAndUrls: args.storageIdsAndUrls as StorageIdAndUrl[],
-        metadata: args.metadata as Record<string, unknown>,
-      });
-    },
-  });
-
-  return { checkUpload, onUploaded };
+    onUploaded: internalMutationGeneric({
+      args: {
+        route: v.string(),
+        request: v.record(v.string(), v.union(v.string(), v.array(v.string()))),
+        storageIdsAndUrls: v.array(
+          v.object({ id: v.id("_storage"), url: v.string() }),
+        ),
+        metadata: v.any(),
+      },
+      handler: async (ctx, args): Promise<unknown> => {
+        const route = routeMap.get(args.route);
+        if (!route) {
+          throw new Error(`Unknown upload route: "${args.route}"`);
+        }
+        if (!route.onUploaded) {
+          return null;
+        }
+        return await route.onUploaded(ctx as MutationCtx, {
+          request: args.request,
+          storageIdsAndUrls: args.storageIdsAndUrls as StorageIdAndUrl[],
+          metadata: args.metadata as Record<string, unknown>,
+        });
+      },
+    }),
+  };
 }
 
-export function registerRoutes<const Routes extends UploadRoutes>(
+function registerHttpRoutes<const Routes extends UploadRoutes>(
   http: HttpRouter,
-  component: ComponentApi,
-  { pathPrefix = "/storage", routes, uploads }: RegisterRoutesProps<Routes>,
-) {
-  for (const routeName of Object.keys(routes) as RouteNames<Routes>[]) {
+  options: {
+    component: ComponentApi;
+    storageFunctions: StorageFunctions;
+    routes: Routes;
+    pathPrefix: string;
+  },
+): void {
+  const { component, storageFunctions, routes, pathPrefix } = options;
+
+  for (const routeName of Object.keys(routes)) {
     const route = routes[routeName];
+    const uploadPath = `${pathPrefix}/${routeName}/upload`;
+
+    // POST handler for file uploads
     http.route({
-      path: `${pathPrefix}/${routeName}/upload`,
+      path: uploadPath,
       method: "POST",
       handler: httpActionGeneric(async (ctx, request) => {
-        const formData = await request.formData();
-        const files = formData
-          .getAll("files")
-          .filter((value): value is File => isFile(value) && value.size > 0);
+        const corsHeaders = buildCorsHeaders(request);
 
-        if (files.length === 0) {
-          return new Response(JSON.stringify({ error: "No files uploaded" }), {
-            status: 400,
-          });
-        }
+        try {
+          const formData = await request.formData();
+          const files = formData
+            .getAll("files")
+            .filter((value): value is File => isFile(value) && value.size > 0);
 
-        if (files.length > route.maxFileCount) {
-          return new Response(
-            JSON.stringify({ error: "Too many files uploaded" }),
-            { status: 400 },
-          );
-        }
-
-        for (const file of files) {
-          if (!isMimeAllowed(file.type, route.fileTypes)) {
-            return new Response(
-              JSON.stringify({ error: "Invalid file type" }),
-              { status: 400 },
+          // Validate file count
+          if (files.length === 0) {
+            return errorResponse("No files uploaded", 400, corsHeaders);
+          }
+          // If the number of uploaded files exceeds the route's maximum (or 1 if not specified), return an error
+          const maxFileCount = route.maxFileCount ?? 1;
+          if (files.length > maxFileCount) {
+            return errorResponse(
+              `Too many files. Maximum allowed: ${maxFileCount}`,
+              400,
+              corsHeaders,
             );
           }
 
-          if (file.size > route.maxFileSize) {
-            return new Response(JSON.stringify({ error: "File too large" }), {
-              status: 400,
-            });
+          // Validate each file
+          for (const file of files) {
+            if (!isMimeTypeAllowed(file.type, route.fileTypes)) {
+              return errorResponse(
+                `Invalid file type: ${file.type}. Allowed: ${route.fileTypes.join(", ")}`,
+                400,
+                corsHeaders,
+              );
+            }
+            if (file.size > route.maxFileSize) {
+              return errorResponse(
+                `File "${file.name}" exceeds maximum size of ${route.maxFileSize} bytes`,
+                400,
+                corsHeaders,
+              );
+            }
           }
-        }
 
-        const requestWithoutFiles = normalizeFormData(formData);
+          const normalizedRequest = normalizeFormData(formData);
 
-        const metadata: Record<string, unknown> =
-          uploads && route.checkUpload
-            ? await ctx.runMutation(uploads.checkUpload, {
+          // Run pre-upload validation
+          const metadata: Record<string, unknown> = route.checkUpload
+            ? await ctx.runMutation(storageFunctions.checkUpload, {
                 route: routeName,
-                request: requestWithoutFiles,
+                request: normalizedRequest,
               })
             : {};
 
-        const storageIdsAndUrls = await Promise.all(
-          files.map(async (file) => {
-            const storageId = await ctx.storage.store(file);
-            const storageUrl = await ctx.storage.getUrl(storageId);
+          // Store files
+          const storageIdsAndUrls = await Promise.all(
+            files.map(async (file) => {
+              const storageId = await ctx.storage.store(file);
+              const url = await ctx.storage.getUrl(storageId);
+              if (!url) {
+                throw new Error(
+                  `Failed to get URL for uploaded file: ${file.name}`,
+                );
+              }
+              return { id: storageId, url };
+            }),
+          );
 
-            if (!storageUrl) {
-              throw new Error("Failed to get URL for uploaded file"); // TODO: return response with error
-            }
+          // Create metadata records in component
+          await ctx.runMutation(component.lib.createFilesMetadata, {
+            storageIdsAndUrls,
+            metadata,
+            bucket: routeName,
+          });
 
-            return { id: storageId, url: storageUrl };
-          }),
-        );
-
-        await ctx.runMutation(component.lib.createFilesMetadata, {
-          storageIdsAndUrls,
-          metadata,
-          bucket: routeName,
-        });
-
-        const result =
-          uploads && route.onUploaded
-            ? await ctx.runMutation(uploads.onUploaded, {
+          // Run post-upload handler
+          const result = route.onUploaded
+            ? await ctx.runMutation(storageFunctions.onUploaded, {
                 route: routeName,
-                request: requestWithoutFiles,
+                request: normalizedRequest,
                 storageIdsAndUrls,
                 metadata,
               })
             : null;
 
-        return new Response(
-          result ? JSON.stringify(result) : "File(s) uploaded successfully",
-          { status: 200 },
-        );
+          return jsonResponse(
+            result ?? { success: true, filesCount: storageIdsAndUrls.length },
+            200,
+            corsHeaders,
+          );
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : "Upload failed";
+          return errorResponse(message, 500, corsHeaders);
+        }
       }),
     });
 
+    // OPTIONS handler for CORS preflight
     http.route({
-      path: `${pathPrefix}/${routeName}/upload`,
+      path: uploadPath,
       method: "OPTIONS",
       handler: httpActionGeneric(async (_, request) => {
         const headers = request.headers;
-        if (
+        const isPreflightRequest =
           headers.get("Origin") !== null &&
           headers.get("Access-Control-Request-Method") !== null &&
-          headers.get("Access-Control-Request-Headers") !== null
-        ) {
+          headers.get("Access-Control-Request-Headers") !== null;
+
+        if (isPreflightRequest) {
           return new Response(null, {
             headers: new Headers(buildCorsHeaders(request)),
           });
-        } else {
-          return new Response();
         }
+        return new Response();
       }),
     });
   }
 }
 
-export const createClient = (component: ComponentApi) => {
+/**
+ * Creates a storage client for managing file uploads.
+ *
+ * @example
+ * ```ts
+ * // storage.ts
+ * const routes = {
+ *   images: route({ ... }),
+ *   pdfs: route({ ... }),
+ * };
+ *
+ * export const { checkUpload, onUploaded } = createStorageMutations(routes);
+ *
+ * export const storage = createClient(components.storage, { routes });
+ *
+ * // http.ts
+ * import { storage } from "./storage";
+ * storage.registerRoutes(http, { storageFunctions: internal.storage });
+ * ```
+ */
+export function createClient<const Routes extends UploadRoutes>(
+  component: ComponentApi,
+  options: {
+    routes: Routes;
+    pathPrefix?: string;
+  },
+) {
+  const { routes, pathPrefix = "/storage" } = options;
+
   return {
+    /**
+     * Register HTTP routes for file uploads.
+     * Call this in your http.ts file.
+     */
+    registerRoutes(
+      http: HttpRouter,
+      opts: { storageFunctions: StorageFunctions },
+    ): void {
+      registerHttpRoutes(http, {
+        component,
+        storageFunctions: opts.storageFunctions,
+        routes,
+        pathPrefix,
+      });
+    },
+
+    /**
+     * Get a single file by ID.
+     */
     async getFile(
       ctx: QueryCtx,
       fileId: Id<"files">,
     ): Promise<Doc<"files"> | null> {
-      return await ctx.runQuery(component.lib.getFilesMetadata, {
+      const files = await ctx.runQuery(component.lib.getFilesMetadata, {
         fileIds: [fileId],
       });
+      return files[0] ?? null;
     },
+
+    /**
+     * Get multiple files by their IDs.
+     */
     async listFiles(
       ctx: QueryCtx,
       fileIds: Id<"files">[],
-    ): Promise<Doc<"files">[]> {
+    ): Promise<(Doc<"files"> | undefined)[]> {
       return await ctx.runQuery(component.lib.getFilesMetadata, { fileIds });
     },
+
+    /**
+     * Delete a single file and its storage.
+     */
     async deleteFile(ctx: MutationCtx, fileId: Id<"files">): Promise<void> {
-      const file = await ctx.runQuery(component.lib.getFilesMetadata, {
+      const files = await ctx.runQuery(component.lib.getFilesMetadata, {
         fileIds: [fileId],
       });
-      await ctx.storage.delete(file.storageId as Id<"_storage">);
-      return await ctx.runMutation(component.lib.deleteFilesMetadata, {
-        fileIds: [fileId],
-      });
+      const file = files[0];
+      if (file) {
+        await ctx.storage.delete(file.storageId as Id<"_storage">);
+        await ctx.runMutation(component.lib.deleteFilesMetadata, {
+          fileIds: [fileId],
+        });
+      }
     },
+
+    /**
+     * Delete multiple files and their storage.
+     */
     async deleteFiles(ctx: MutationCtx, fileIds: Id<"files">[]): Promise<void> {
+      if (fileIds.length === 0) return;
+
       const files = await ctx.runQuery(component.lib.getFilesMetadata, {
         fileIds,
       });
+
       await Promise.all(
-        files.map(async (file: Doc<"files">) => {
-          await ctx.storage.delete(file.storageId as Id<"_storage">);
-        }),
+        files
+          .filter(
+            (file: Doc<"files"> | undefined): file is Doc<"files"> =>
+              file !== undefined,
+          )
+          .map((file: Doc<"files">) =>
+            ctx.storage.delete(file.storageId as Id<"_storage">),
+          ),
       );
-      return await ctx.runMutation(component.lib.deleteFilesMetadata, {
-        fileIds,
-      });
+
+      await ctx.runMutation(component.lib.deleteFilesMetadata, { fileIds });
     },
   };
-};
+}
+
+// Re-export types for convenience
+export type { NormalizedFormData, StorageIdAndUrl };
