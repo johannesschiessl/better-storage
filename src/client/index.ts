@@ -37,7 +37,10 @@ export type UploadRouteConfig<
    * Return value is passed to onUploaded as `metadata`.
    */
   checkUpload?: RequireAuth extends true
-    ? (args: { ctx: MutationCtx; identity: UserIdentity }) => Promise<Metadata> | Metadata
+    ? (args: {
+        ctx: MutationCtx;
+        identity: UserIdentity;
+      }) => Promise<Metadata> | Metadata
     : (args: { ctx: MutationCtx }) => Promise<Metadata> | Metadata;
   /**
    * Called after files are successfully uploaded.
@@ -151,11 +154,24 @@ function errorResponse(
   return jsonResponse({ error }, status, corsHeaders);
 }
 
-async function checkAuth(ctx: GenericActionCtx<any>){
+/**
+ * Error class for HTTP errors with status codes.
+ */
+class HttpError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+  }
+}
+
+async function checkAuth(ctx: GenericActionCtx<any>) {
   const identity = await ctx.auth.getUserIdentity();
 
   if (!identity) {
-    throw new Error("Unauthorized");
+    throw new HttpError("Unauthorized", 401);
   }
 
   return identity;
@@ -221,14 +237,21 @@ export function createStorageMutations<const Routes extends UploadRoutes>(
           if (!args.identity) {
             throw new Error("Identity required for authenticated route");
           }
-          return await (route.checkUpload as (
-            args: { ctx: MutationCtx; identity: UserIdentity },
-          ) => Promise<Record<string, unknown>> | Record<string, unknown>)({
+          return await (
+            route.checkUpload as (args: {
+              ctx: MutationCtx;
+              identity: UserIdentity;
+            }) => Promise<Record<string, unknown>> | Record<string, unknown>
+          )({
             ctx: ctx as MutationCtx,
             identity: args.identity as UserIdentity,
           });
         } else {
-          return await (route.checkUpload as (args: { ctx: MutationCtx }) => Promise<Record<string, unknown>> | Record<string, unknown>)({
+          return await (
+            route.checkUpload as (args: {
+              ctx: MutationCtx;
+            }) => Promise<Record<string, unknown>> | Record<string, unknown>
+          )({
             ctx: ctx as MutationCtx,
           });
         }
@@ -238,7 +261,7 @@ export function createStorageMutations<const Routes extends UploadRoutes>(
     onUploaded: internalMutationGeneric({
       args: {
         route: v.string(),
-        identity: v.optional(v.any()),  
+        identity: v.optional(v.any()),
         storageIdsAndUrls: v.array(
           v.object({ id: v.id("_storage"), url: v.string() }),
         ),
@@ -256,27 +279,27 @@ export function createStorageMutations<const Routes extends UploadRoutes>(
           if (!args.identity) {
             throw new Error("Identity required for authenticated route");
           }
-          return await (route.onUploaded as (
-            args: {
+          return await (
+            route.onUploaded as (args: {
               ctx: MutationCtx;
               identity: UserIdentity;
               storageIdsAndUrls: StorageIdAndUrl[];
               metadata: Record<string, unknown>;
-            },
-          ) => Promise<unknown> | unknown)({
+            }) => Promise<unknown> | unknown
+          )({
             ctx: ctx as MutationCtx,
             identity: args.identity as UserIdentity,
             storageIdsAndUrls: args.storageIdsAndUrls as StorageIdAndUrl[],
             metadata: args.metadata as Record<string, unknown>,
           });
         } else {
-          return await (route.onUploaded as (
-            args: {
+          return await (
+            route.onUploaded as (args: {
               ctx: MutationCtx;
               storageIdsAndUrls: StorageIdAndUrl[];
               metadata: Record<string, unknown>;
-            },
-          ) => Promise<unknown> | unknown)({
+            }) => Promise<unknown> | unknown
+          )({
             ctx: ctx as MutationCtx,
             storageIdsAndUrls: args.storageIdsAndUrls as StorageIdAndUrl[],
             metadata: args.metadata as Record<string, unknown>,
@@ -400,7 +423,23 @@ function registerHttpRoutes<const Routes extends UploadRoutes>(
         } catch (error) {
           const message =
             error instanceof Error ? error.message : "Upload failed";
-          return errorResponse(message, 500, corsHeaders);
+
+          // Check if error has a status code in the 400-403 range
+          let status = 500;
+          if (error instanceof HttpError) {
+            status = error.status;
+          } else if (
+            error instanceof Error &&
+            "status" in error &&
+            typeof (error as { status: unknown }).status === "number"
+          ) {
+            const errorStatus = (error as { status: number }).status;
+            if (errorStatus >= 400 && errorStatus <= 403) {
+              status = errorStatus;
+            }
+          }
+
+          return errorResponse(message, status, corsHeaders);
         }
       }),
     });
