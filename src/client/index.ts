@@ -77,8 +77,6 @@ type StorageFunctions = {
   >;
 };
 
-
-
 function getAllowedOrigin(request: Request): string {
   return request.headers.get("Origin") ?? process.env.SITE_URL ?? "*";
 }
@@ -159,8 +157,6 @@ function errorResponse(
   return jsonResponse({ error }, status, corsHeaders);
 }
 
-
-
 /**
  * Helper function to define a route with full type inference.
  * The return type of `checkUpload` automatically becomes the type of
@@ -192,8 +188,6 @@ export function route<
 ): UploadRouteConfig<Metadata, Result> {
   return config;
 }
-
-
 
 /**
  * Creates internal mutations for handling upload validation and post-upload processing.
@@ -248,8 +242,6 @@ export function createStorageMutations<const Routes extends UploadRoutes>(
     }),
   };
 }
-
-
 
 function registerHttpRoutes<const Routes extends UploadRoutes>(
   http: HttpRouter,

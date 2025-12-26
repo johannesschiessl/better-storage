@@ -1,6 +1,5 @@
 "use client";
 
-
 export const useUpload = (
   siteUrl: string,
   route: string,
@@ -40,7 +39,7 @@ export const useUpload = (
       );
     }
 
-    return (await res.json());
+    return await res.json();
   };
 
   return { upload };
