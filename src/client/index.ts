@@ -2,24 +2,27 @@ import {
   httpActionGeneric,
   internalMutationGeneric,
   type FunctionReference,
+  type GenericActionCtx,
   type HttpRouter,
+  type UserIdentity,
 } from "convex/server";
 import type { ComponentApi } from "../component/_generated/component.js";
 import type { Doc, Id } from "../component/_generated/dataModel.js";
 import type { MutationCtx, QueryCtx } from "../component/_generated/server.js";
 import { v } from "convex/values";
 
-type NormalizedFormData = Record<string, string | string[]>;
 type StorageIdAndUrl = { id: Id<"_storage">; url: string };
 
 /**
  * Configuration for a single upload route.
  * @template Metadata - The type returned by checkUpload and passed to onUploaded
  * @template Result - The type returned by onUploaded
+ * @template RequireAuth - Whether authentication is required
  */
 export type UploadRouteConfig<
   Metadata extends Record<string, unknown> = Record<string, unknown>,
   Result = unknown,
+  RequireAuth extends boolean = false,
 > = {
   /** Allowed MIME types (supports wildcards like "image/*") */
   fileTypes: string[];
@@ -27,37 +30,47 @@ export type UploadRouteConfig<
   maxFileSize: number;
   /** Maximum number of files per upload */
   maxFileCount?: number;
+  /** Whether to require authentication for the route */
+  requireAuth?: RequireAuth;
   /**
    * Called before upload to validate and prepare metadata.
    * Return value is passed to onUploaded as `metadata`.
    */
-  checkUpload?: (
-    ctx: MutationCtx,
-    request: NormalizedFormData,
-  ) => Promise<Metadata> | Metadata;
+  checkUpload?: RequireAuth extends true
+    ? (args: { ctx: MutationCtx; identity: UserIdentity }) => Promise<Metadata> | Metadata
+    : (args: { ctx: MutationCtx }) => Promise<Metadata> | Metadata;
   /**
    * Called after files are successfully uploaded.
    * Return value is sent back to the client.
    */
-  onUploaded?: (
-    ctx: MutationCtx,
-    args: {
-      request: NormalizedFormData;
-      storageIdsAndUrls: StorageIdAndUrl[];
-      metadata: Metadata;
-    },
-  ) => Promise<Result> | Result;
+  onUploaded?: RequireAuth extends true
+    ? (args: {
+        ctx: MutationCtx;
+        identity: UserIdentity;
+        storageIdsAndUrls: StorageIdAndUrl[];
+        metadata: Metadata;
+      }) => Promise<Result> | Result
+    : (args: {
+        ctx: MutationCtx;
+        storageIdsAndUrls: StorageIdAndUrl[];
+        metadata: Metadata;
+      }) => Promise<Result> | Result;
 };
 
 /** A collection of named upload routes */
-export type UploadRoutes = Record<string, UploadRouteConfig<any, any>>;
+export type UploadRoutes = Record<
+  string,
+  UploadRouteConfig<any, any, true> | UploadRouteConfig<any, any, false>
+>;
 
 type UploadCheckArgs = {
   route: string;
-  request: NormalizedFormData;
+  identity?: UserIdentity;
 };
 
-type UploadOnUploadedArgs = UploadCheckArgs & {
+type UploadOnUploadedArgs = {
+  route: string;
+  identity?: UserIdentity;
   storageIdsAndUrls: StorageIdAndUrl[];
   metadata: Record<string, unknown>;
 };
@@ -106,25 +119,6 @@ function isFile(value: FormDataEntryValue): value is File {
   );
 }
 
-function normalizeFormData(formData: FormData): NormalizedFormData {
-  const result: NormalizedFormData = {};
-
-  for (const [key, value] of formData.entries()) {
-    if (isFile(value)) continue;
-
-    const existing = result[key];
-    if (existing === undefined) {
-      result[key] = value;
-    } else if (Array.isArray(existing)) {
-      existing.push(value);
-    } else {
-      result[key] = [existing, value];
-    }
-  }
-
-  return result;
-}
-
 function isMimeTypeAllowed(fileType: string, allowedTypes: string[]): boolean {
   return allowedTypes.some((allowedType) => {
     if (allowedType.endsWith("/*")) {
@@ -157,6 +151,16 @@ function errorResponse(
   return jsonResponse({ error }, status, corsHeaders);
 }
 
+async function checkAuth(ctx: GenericActionCtx<any>){
+  const identity = await ctx.auth.getUserIdentity();
+
+  if (!identity) {
+    throw new Error("Unauthorized");
+  }
+
+  return identity;
+}
+
 /**
  * Helper function to define a route with full type inference.
  * The return type of `checkUpload` automatically becomes the type of
@@ -169,10 +173,10 @@ function errorResponse(
  *     fileTypes: ["image/*"],
  *     maxFileSize: 5 * 1024 * 1024,
  *     maxFileCount: 10,
- *     checkUpload: async (ctx, request) => {
+ *     checkUpload: async ({ ctx }) => {
  *       return { userId: "123" };
  *     },
- *     onUploaded: async (ctx, { metadata }) => {
+ *     onUploaded: async ({ ctx, storageIdsAndUrls, metadata }) => {
  *       // metadata is typed as { userId: string }
  *       console.log(metadata.userId);
  *     },
@@ -183,9 +187,10 @@ function errorResponse(
 export function route<
   Metadata extends Record<string, unknown> = Record<string, unknown>,
   Result = unknown,
+  RequireAuth extends boolean = false,
 >(
-  config: UploadRouteConfig<Metadata, Result>,
-): UploadRouteConfig<Metadata, Result> {
+  config: UploadRouteConfig<Metadata, Result, RequireAuth>,
+): UploadRouteConfig<Metadata, Result, RequireAuth> {
   return config;
 }
 
@@ -202,7 +207,7 @@ export function createStorageMutations<const Routes extends UploadRoutes>(
     checkUpload: internalMutationGeneric({
       args: {
         route: v.string(),
-        request: v.record(v.string(), v.union(v.string(), v.array(v.string()))),
+        identity: v.optional(v.any()),
       },
       handler: async (ctx, args): Promise<Record<string, unknown>> => {
         const route = routeMap.get(args.route);
@@ -212,14 +217,28 @@ export function createStorageMutations<const Routes extends UploadRoutes>(
         if (!route.checkUpload) {
           return {};
         }
-        return await route.checkUpload(ctx as MutationCtx, args.request);
+        if (route.requireAuth) {
+          if (!args.identity) {
+            throw new Error("Identity required for authenticated route");
+          }
+          return await (route.checkUpload as (
+            args: { ctx: MutationCtx; identity: UserIdentity },
+          ) => Promise<Record<string, unknown>> | Record<string, unknown>)({
+            ctx: ctx as MutationCtx,
+            identity: args.identity as UserIdentity,
+          });
+        } else {
+          return await (route.checkUpload as (args: { ctx: MutationCtx }) => Promise<Record<string, unknown>> | Record<string, unknown>)({
+            ctx: ctx as MutationCtx,
+          });
+        }
       },
     }),
 
     onUploaded: internalMutationGeneric({
       args: {
         route: v.string(),
-        request: v.record(v.string(), v.union(v.string(), v.array(v.string()))),
+        identity: v.optional(v.any()),  
         storageIdsAndUrls: v.array(
           v.object({ id: v.id("_storage"), url: v.string() }),
         ),
@@ -233,11 +252,36 @@ export function createStorageMutations<const Routes extends UploadRoutes>(
         if (!route.onUploaded) {
           return null;
         }
-        return await route.onUploaded(ctx as MutationCtx, {
-          request: args.request,
-          storageIdsAndUrls: args.storageIdsAndUrls as StorageIdAndUrl[],
-          metadata: args.metadata as Record<string, unknown>,
-        });
+        if (route.requireAuth) {
+          if (!args.identity) {
+            throw new Error("Identity required for authenticated route");
+          }
+          return await (route.onUploaded as (
+            args: {
+              ctx: MutationCtx;
+              identity: UserIdentity;
+              storageIdsAndUrls: StorageIdAndUrl[];
+              metadata: Record<string, unknown>;
+            },
+          ) => Promise<unknown> | unknown)({
+            ctx: ctx as MutationCtx,
+            identity: args.identity as UserIdentity,
+            storageIdsAndUrls: args.storageIdsAndUrls as StorageIdAndUrl[],
+            metadata: args.metadata as Record<string, unknown>,
+          });
+        } else {
+          return await (route.onUploaded as (
+            args: {
+              ctx: MutationCtx;
+              storageIdsAndUrls: StorageIdAndUrl[];
+              metadata: Record<string, unknown>;
+            },
+          ) => Promise<unknown> | unknown)({
+            ctx: ctx as MutationCtx,
+            storageIdsAndUrls: args.storageIdsAndUrls as StorageIdAndUrl[],
+            metadata: args.metadata as Record<string, unknown>,
+          });
+        }
       },
     }),
   };
@@ -266,6 +310,12 @@ function registerHttpRoutes<const Routes extends UploadRoutes>(
         const corsHeaders = buildCorsHeaders(request);
 
         try {
+          let identity: UserIdentity | undefined;
+
+          if (route.requireAuth) {
+            identity = await checkAuth(ctx); // TODO: figure types out...
+          }
+
           const formData = await request.formData();
           const files = formData
             .getAll("files")
@@ -303,13 +353,11 @@ function registerHttpRoutes<const Routes extends UploadRoutes>(
             }
           }
 
-          const normalizedRequest = normalizeFormData(formData);
-
           // Run pre-upload validation
           const metadata: Record<string, unknown> = route.checkUpload
             ? await ctx.runMutation(storageFunctions.checkUpload, {
                 route: routeName,
-                request: normalizedRequest,
+                ...(route.requireAuth ? { identity } : {}),
               })
             : {};
 
@@ -338,7 +386,7 @@ function registerHttpRoutes<const Routes extends UploadRoutes>(
           const result = route.onUploaded
             ? await ctx.runMutation(storageFunctions.onUploaded, {
                 route: routeName,
-                request: normalizedRequest,
+                ...(route.requireAuth ? { identity } : {}),
                 storageIdsAndUrls,
                 metadata,
               })
@@ -491,4 +539,4 @@ export function createClient<const Routes extends UploadRoutes>(
 }
 
 // Re-export types for convenience
-export type { NormalizedFormData, StorageIdAndUrl };
+export type { StorageIdAndUrl };
