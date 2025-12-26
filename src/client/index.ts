@@ -276,9 +276,10 @@ function registerHttpRoutes<const Routes extends UploadRoutes>(
             return errorResponse("No files uploaded", 400, corsHeaders);
           }
           // If the number of uploaded files exceeds the route's maximum (or 1 if not specified), return an error
-          if (files.length > (route.maxFileCount ?? 1)) {
+          const maxFileCount = route.maxFileCount ?? 1;
+          if (files.length > maxFileCount) {
             return errorResponse(
-              `Too many files. Maximum allowed: ${route.maxFileCount}`,
+              `Too many files. Maximum allowed: ${maxFileCount}`,
               400,
               corsHeaders,
             );
