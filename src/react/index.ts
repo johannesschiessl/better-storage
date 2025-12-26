@@ -1,11 +1,5 @@
 "use client";
 
-type UploadResult =
-  | {
-      storageId: string;
-      url: string | null;
-    }
-  | string;
 
 export const useUpload = (
   siteUrl: string,
@@ -22,7 +16,7 @@ export const useUpload = (
     siteUrl,
   );
 
-  const upload = async (files: File[]): Promise<UploadResult> => {
+  const upload = async (files: File[]) => {
     if (!files.length) {
       throw new Error("No files provided for upload");
     }
@@ -46,7 +40,7 @@ export const useUpload = (
       );
     }
 
-    return (await res.json()) as UploadResult;
+    return (await res.json());
   };
 
   return { upload };
