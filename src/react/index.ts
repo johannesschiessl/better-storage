@@ -4,11 +4,12 @@ export const useUpload = (
   siteUrl: string,
   route: string,
   options?: {
+    authToken?: string;
     pathPrefix?: string;
     signal?: AbortSignal;
   },
 ) => {
-  const { pathPrefix = "/storage", signal } = options ?? {};
+  const { authToken, pathPrefix = "/storage", signal } = options ?? {};
 
   const endpoint = new URL(
     `${pathPrefix.replace(/\/$/, "")}/${route}/upload`,
@@ -28,6 +29,9 @@ export const useUpload = (
     const res = await fetch(endpoint, {
       method: "POST",
       body: formData,
+      headers: {
+        Authorization: authToken ? `Bearer ${authToken}` : "",
+      },
       signal,
       credentials: "omit",
     });
