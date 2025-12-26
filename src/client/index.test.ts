@@ -10,7 +10,11 @@ const routes = {
     checkUpload: async ({ ctx: _ctx }) => {
       return { uploadedAt: Date.now() };
     },
-    onUploaded: async ({ ctx: _ctx, storageIdsAndUrls: _storageIdsAndUrls, metadata }) => {
+    onUploaded: async ({
+      ctx: _ctx,
+      storageIdsAndUrls: _storageIdsAndUrls,
+      metadata,
+    }) => {
       return { success: true, uploadedAt: metadata.uploadedAt };
     },
   }),
