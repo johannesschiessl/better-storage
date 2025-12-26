@@ -9,12 +9,11 @@ export const routes = {
   imagePost: route({
     fileTypes: ["image/*"],
     maxFileSize: 1024 * 1024 * 5, // 5MB
-    checkUpload: async (ctx, request) => {
-      console.log("Request:", request);
+    requireAuth: false, // TODO: setup better auth for example to test this
+    checkUpload: async () => {
       return { test: "test" as const };
     },
-    onUploaded: async (ctx, { request, storageIdsAndUrls, metadata }) => {
-      console.log("Request:", request);
+    onUploaded: async ({ storageIdsAndUrls, metadata }) => {
       console.log("Files:", storageIdsAndUrls);
       return { success: true, test: metadata.test };
     },

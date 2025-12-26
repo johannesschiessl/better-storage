@@ -7,10 +7,14 @@ const routes = {
     fileTypes: ["image/jpeg", "image/png"],
     maxFileSize: 1024 * 1024 * 5,
     maxFileCount: 10,
-    checkUpload: async (_ctx, _request) => {
+    checkUpload: async ({ ctx: _ctx }) => {
       return { uploadedAt: Date.now() };
     },
-    onUploaded: async (_ctx, { metadata }) => {
+    onUploaded: async ({
+      ctx: _ctx,
+      storageIdsAndUrls: _storageIdsAndUrls,
+      metadata,
+    }) => {
       return { success: true, uploadedAt: metadata.uploadedAt };
     },
   }),
