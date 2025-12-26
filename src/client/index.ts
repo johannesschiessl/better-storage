@@ -2,16 +2,12 @@ import {
   httpActionGeneric,
   internalMutationGeneric,
   type FunctionReference,
+  type HttpRouter,
 } from "convex/server";
-import type { HttpRouter } from "convex/server";
 import type { ComponentApi } from "../component/_generated/component.js";
 import type { Doc, Id } from "../component/_generated/dataModel.js";
 import type { MutationCtx, QueryCtx } from "../component/_generated/server.js";
 import { v } from "convex/values";
-
-// ============================================================================
-// Types
-// ============================================================================
 
 type NormalizedFormData = Record<string, string | string[]>;
 type StorageIdAndUrl = { id: Id<"_storage">; url: string };
@@ -30,7 +26,7 @@ export type UploadRouteConfig<
   /** Maximum file size in bytes */
   maxFileSize: number;
   /** Maximum number of files per upload */
-  maxFileCount: number;
+  maxFileCount?: number;
   /**
    * Called before upload to validate and prepare metadata.
    * Return value is passed to onUploaded as `metadata`.
@@ -56,8 +52,6 @@ export type UploadRouteConfig<
 /** A collection of named upload routes */
 export type UploadRoutes = Record<string, UploadRouteConfig<any, any>>;
 
-type RouteNames<Routes extends UploadRoutes> = Extract<keyof Routes, string>;
-
 type UploadCheckArgs = {
   route: string;
   request: NormalizedFormData;
@@ -68,7 +62,7 @@ type UploadOnUploadedArgs = UploadCheckArgs & {
   metadata: Record<string, unknown>;
 };
 
-type UploadMutations = {
+type StorageFunctions = {
   checkUpload: FunctionReference<
     "mutation",
     "internal",
@@ -83,9 +77,7 @@ type UploadMutations = {
   >;
 };
 
-// ============================================================================
-// Utility Functions
-// ============================================================================
+
 
 function getAllowedOrigin(request: Request): string {
   return request.headers.get("Origin") ?? process.env.SITE_URL ?? "*";
@@ -167,53 +159,53 @@ function errorResponse(
   return jsonResponse({ error }, status, corsHeaders);
 }
 
-// ============================================================================
-// Client Factory
-// ============================================================================
 
-export function createClient(component: ComponentApi) {
-  /**
-   * Helper function to define a route with full type inference.
-   * The return type of `checkUpload` automatically becomes the type of
-   * `metadata` in `onUploaded`.
-   *
-   * @example
-   * ```ts
-   * const routes = {
-   *   images: storage.defineRoute({
-   *     fileTypes: ["image/*"],
-   *     maxFileSize: 5 * 1024 * 1024,
-   *     maxFileCount: 10,
-   *     checkUpload: async (ctx, request) => {
-   *       return { userId: "123", category: request.category };
-   *     },
-   *     onUploaded: async (ctx, { metadata }) => {
-   *       // metadata is typed as { userId: string; category: string | string[] }
-   *       console.log(metadata.userId);
-   *     },
-   *   }),
-   * };
-   * 
-   * ```
-   */
-  function defineRoute<
-    Metadata extends Record<string, unknown> = Record<string, unknown>,
-    Result = unknown,
-  >(
-    config: UploadRouteConfig<Metadata, Result>,
-  ): UploadRouteConfig<Metadata, Result> {
-    return config;
-  }
 
-  /**
-   * Creates internal mutations for handling upload validation and post-upload processing.
-   */
-  function createUploadMutations<const Routes extends UploadRoutes>(
-    routes: Routes,
-  ) {
-    const routeMap = new Map(Object.entries(routes));
+/**
+ * Helper function to define a route with full type inference.
+ * The return type of `checkUpload` automatically becomes the type of
+ * `metadata` in `onUploaded`.
+ *
+ * @example
+ * ```ts
+ * const routes = {
+ *   images: route({
+ *     fileTypes: ["image/*"],
+ *     maxFileSize: 5 * 1024 * 1024,
+ *     maxFileCount: 10,
+ *     checkUpload: async (ctx, request) => {
+ *       return { userId: "123" };
+ *     },
+ *     onUploaded: async (ctx, { metadata }) => {
+ *       // metadata is typed as { userId: string }
+ *       console.log(metadata.userId);
+ *     },
+ *   }),
+ * };
+ * ```
+ */
+export function route<
+  Metadata extends Record<string, unknown> = Record<string, unknown>,
+  Result = unknown,
+>(
+  config: UploadRouteConfig<Metadata, Result>,
+): UploadRouteConfig<Metadata, Result> {
+  return config;
+}
 
-    const checkUpload = internalMutationGeneric({
+
+
+/**
+ * Creates internal mutations for handling upload validation and post-upload processing.
+ * These mutations must be exported from your storage file.
+ */
+export function createStorageMutations<const Routes extends UploadRoutes>(
+  routes: Routes,
+) {
+  const routeMap = new Map(Object.entries(routes));
+
+  return {
+    checkUpload: internalMutationGeneric({
       args: {
         route: v.string(),
         request: v.record(v.string(), v.union(v.string(), v.array(v.string()))),
@@ -228,9 +220,9 @@ export function createClient(component: ComponentApi) {
         }
         return await route.checkUpload(ctx as MutationCtx, args.request);
       },
-    });
+    }),
 
-    const onUploaded = internalMutationGeneric({
+    onUploaded: internalMutationGeneric({
       args: {
         route: v.string(),
         request: v.record(v.string(), v.union(v.string(), v.array(v.string()))),
@@ -253,214 +245,190 @@ export function createClient(component: ComponentApi) {
           metadata: args.metadata as Record<string, unknown>,
         });
       },
-    });
+    }),
+  };
+}
 
-    return { checkUpload, onUploaded };
-  }
 
-  /**
-   * Internal function to register HTTP routes for file uploads.
-   */
-  function registerHttpRoutes<const Routes extends UploadRoutes>(
-    http: HttpRouter,
-    options: {
-      pathPrefix: string;
-      routes: Routes;
-      uploads?: UploadMutations;
-    },
-  ): void {
-    const { pathPrefix, routes, uploads } = options;
 
-    for (const routeName of Object.keys(routes) as RouteNames<Routes>[]) {
-      const route = routes[routeName];
-      const uploadPath = `${pathPrefix}/${routeName}/upload`;
+function registerHttpRoutes<const Routes extends UploadRoutes>(
+  http: HttpRouter,
+  options: {
+    component: ComponentApi;
+    storageFunctions: StorageFunctions;
+    routes: Routes;
+    pathPrefix: string;
+  },
+): void {
+  const { component, storageFunctions, routes, pathPrefix } = options;
 
-      // POST handler for file uploads
-      http.route({
-        path: uploadPath,
-        method: "POST",
-        handler: httpActionGeneric(async (ctx, request) => {
-          const corsHeaders = buildCorsHeaders(request);
+  for (const routeName of Object.keys(routes)) {
+    const route = routes[routeName];
+    const uploadPath = `${pathPrefix}/${routeName}/upload`;
 
-          try {
-            const formData = await request.formData();
-            const files = formData
-              .getAll("files")
-              .filter((value): value is File => isFile(value) && value.size > 0);
+    // POST handler for file uploads
+    http.route({
+      path: uploadPath,
+      method: "POST",
+      handler: httpActionGeneric(async (ctx, request) => {
+        const corsHeaders = buildCorsHeaders(request);
 
-            // Validate file count
-            if (files.length === 0) {
-              return errorResponse("No files uploaded", 400, corsHeaders);
-            }
-            if (files.length > route.maxFileCount) {
+        try {
+          const formData = await request.formData();
+          const files = formData
+            .getAll("files")
+            .filter((value): value is File => isFile(value) && value.size > 0);
+
+          // Validate file count
+          if (files.length === 0) {
+            return errorResponse("No files uploaded", 400, corsHeaders);
+          }
+          // If the number of uploaded files exceeds the route's maximum (or 1 if not specified), return an error
+          if (files.length > (route.maxFileCount ?? 1)) {
+            return errorResponse(
+              `Too many files. Maximum allowed: ${route.maxFileCount}`,
+              400,
+              corsHeaders,
+            );
+          }
+
+          // Validate each file
+          for (const file of files) {
+            if (!isMimeTypeAllowed(file.type, route.fileTypes)) {
               return errorResponse(
-                `Too many files. Maximum allowed: ${route.maxFileCount}`,
+                `Invalid file type: ${file.type}. Allowed: ${route.fileTypes.join(", ")}`,
                 400,
                 corsHeaders,
               );
             }
-
-            // Validate each file
-            for (const file of files) {
-              if (!isMimeTypeAllowed(file.type, route.fileTypes)) {
-                return errorResponse(
-                  `Invalid file type: ${file.type}. Allowed: ${route.fileTypes.join(", ")}`,
-                  400,
-                  corsHeaders,
-                );
-              }
-              if (file.size > route.maxFileSize) {
-                return errorResponse(
-                  `File "${file.name}" exceeds maximum size of ${route.maxFileSize} bytes`,
-                  400,
-                  corsHeaders,
-                );
-              }
+            if (file.size > route.maxFileSize) {
+              return errorResponse(
+                `File "${file.name}" exceeds maximum size of ${route.maxFileSize} bytes`,
+                400,
+                corsHeaders,
+              );
             }
-
-            const normalizedRequest = normalizeFormData(formData);
-
-            // Run pre-upload validation
-            const metadata: Record<string, unknown> =
-              uploads && route.checkUpload
-                ? await ctx.runMutation(uploads.checkUpload, {
-                    route: routeName,
-                    request: normalizedRequest,
-                  })
-                : {};
-
-            // Store files
-            const storageIdsAndUrls = await Promise.all(
-              files.map(async (file) => {
-                const storageId = await ctx.storage.store(file);
-                const url = await ctx.storage.getUrl(storageId);
-                if (!url) {
-                  throw new Error(
-                    `Failed to get URL for uploaded file: ${file.name}`,
-                  );
-                }
-                return { id: storageId, url };
-              }),
-            );
-
-            // Create metadata records in component
-            await ctx.runMutation(component.lib.createFilesMetadata, {
-              storageIdsAndUrls,
-              metadata,
-              bucket: routeName,
-            });
-
-            // Run post-upload handler
-            const result =
-              uploads && route.onUploaded
-                ? await ctx.runMutation(uploads.onUploaded, {
-                    route: routeName,
-                    request: normalizedRequest,
-                    storageIdsAndUrls,
-                    metadata,
-                  })
-                : null;
-
-            return jsonResponse(
-              result ?? { success: true, filesCount: storageIdsAndUrls.length },
-              200,
-              corsHeaders,
-            );
-          } catch (error) {
-            const message =
-              error instanceof Error ? error.message : "Upload failed";
-            return errorResponse(message, 500, corsHeaders);
           }
-        }),
-      });
 
-      // OPTIONS handler for CORS preflight
-      http.route({
-        path: uploadPath,
-        method: "OPTIONS",
-        handler: httpActionGeneric(async (_, request) => {
-          const headers = request.headers;
-          const isPreflightRequest =
-            headers.get("Origin") !== null &&
-            headers.get("Access-Control-Request-Method") !== null &&
-            headers.get("Access-Control-Request-Headers") !== null;
+          const normalizedRequest = normalizeFormData(formData);
 
-          if (isPreflightRequest) {
-            return new Response(null, {
-              headers: new Headers(buildCorsHeaders(request)),
-            });
-          }
-          return new Response();
-        }),
-      });
-    }
+          // Run pre-upload validation
+          const metadata: Record<string, unknown> = route.checkUpload
+            ? await ctx.runMutation(storageFunctions.checkUpload, {
+                route: routeName,
+                request: normalizedRequest,
+              })
+            : {};
+
+          // Store files
+          const storageIdsAndUrls = await Promise.all(
+            files.map(async (file) => {
+              const storageId = await ctx.storage.store(file);
+              const url = await ctx.storage.getUrl(storageId);
+              if (!url) {
+                throw new Error(
+                  `Failed to get URL for uploaded file: ${file.name}`,
+                );
+              }
+              return { id: storageId, url };
+            }),
+          );
+
+          // Create metadata records in component
+          await ctx.runMutation(component.lib.createFilesMetadata, {
+            storageIdsAndUrls,
+            metadata,
+            bucket: routeName,
+          });
+
+          // Run post-upload handler
+          const result = route.onUploaded
+            ? await ctx.runMutation(storageFunctions.onUploaded, {
+                route: routeName,
+                request: normalizedRequest,
+                storageIdsAndUrls,
+                metadata,
+              })
+            : null;
+
+          return jsonResponse(
+            result ?? { success: true, filesCount: storageIdsAndUrls.length },
+            200,
+            corsHeaders,
+          );
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : "Upload failed";
+          return errorResponse(message, 500, corsHeaders);
+        }
+      }),
+    });
+
+    // OPTIONS handler for CORS preflight
+    http.route({
+      path: uploadPath,
+      method: "OPTIONS",
+      handler: httpActionGeneric(async (_, request) => {
+        const headers = request.headers;
+        const isPreflightRequest =
+          headers.get("Origin") !== null &&
+          headers.get("Access-Control-Request-Method") !== null &&
+          headers.get("Access-Control-Request-Headers") !== null;
+
+        if (isPreflightRequest) {
+          return new Response(null, {
+            headers: new Headers(buildCorsHeaders(request)),
+          });
+        }
+        return new Response();
+      }),
+    });
   }
+}
 
-  /**
-   * Configures upload routes and returns mutations and a bound registerRoutes function.
-   * This is the recommended way to set up file uploads.
-   *
-   * @example
-   * ```ts
-   * // storage.ts
-   * const storageConfig = storage.configureRoutes({
-   *   routes: {
-   *     images: storage.defineRoute({ ... }),
-   *     documents: storage.defineRoute({ ... }),
-   *   },
-   * });
-   *
-   * export const { checkUpload, onUploaded } = storageConfig.mutations;
-   * export const registerStorageRoutes = storageConfig.registerRoutes;
-   *
-   * // http.ts
-   * import { registerStorageRoutes } from "./storage";
-   * registerStorageRoutes(http, { uploads: internal.storage });
-   * ```
-   */
-  function configureRoutes<const Routes extends UploadRoutes>(options: {
+/**
+ * Creates a storage client for managing file uploads.
+ *
+ * @example
+ * ```ts
+ * // storage.ts
+ * const routes = {
+ *   images: route({ ... }),
+ *   pdfs: route({ ... }),
+ * };
+ *
+ * export const { checkUpload, onUploaded } = createStorageMutations(routes);
+ *
+ * export const storage = createClient(components.storage, { routes });
+ *
+ * // http.ts
+ * import { storage } from "./storage";
+ * storage.registerRoutes(http, { storageFunctions: internal.storage });
+ * ```
+ */
+export function createClient<const Routes extends UploadRoutes>(
+  component: ComponentApi,
+  options: {
     routes: Routes;
     pathPrefix?: string;
-  }) {
-    const { routes, pathPrefix = "/storage" } = options;
+  },
+) {
+  const { routes, pathPrefix = "/storage" } = options;
 
-    return {
-      /** Internal mutations to export from your storage file */
-      mutations: createUploadMutations(routes),
-
-      /** Register the HTTP routes. Call this in your http.ts file. */
-      registerRoutes: (
-        http: HttpRouter,
-        opts: { uploads?: UploadMutations },
-      ) => {
-        registerHttpRoutes(http, {
-          pathPrefix,
-          routes,
-          uploads: opts.uploads,
-        });
-      },
-    };
-  }
-
-  // Return the client with all methods
   return {
-    defineRoute,
-    configureRoutes,
-
-    // Legacy methods for backwards compatibility
-    createUploadMutations,
-    registerRoutes: <const Routes extends UploadRoutes>(
+    /**
+     * Register HTTP routes for file uploads.
+     * Call this in your http.ts file.
+     */
+    registerRoutes(
       http: HttpRouter,
-      options: {
-        pathPrefix?: string;
-        routes: Routes;
-        uploads?: UploadMutations;
-      },
-    ) => {
+      opts: { storageFunctions: StorageFunctions },
+    ): void {
       registerHttpRoutes(http, {
-        pathPrefix: options.pathPrefix ?? "/storage",
-        routes: options.routes,
-        uploads: options.uploads,
+        component,
+        storageFunctions: opts.storageFunctions,
+        routes,
+        pathPrefix,
       });
     },
 
