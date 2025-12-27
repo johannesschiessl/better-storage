@@ -1,8 +1,6 @@
 import {
   httpActionGeneric,
   internalMutationGeneric,
-  type FunctionReference,
-  type GenericActionCtx,
   type HttpRouter,
   type UserIdentity,
 } from "convex/server";
@@ -10,172 +8,21 @@ import type { ComponentApi } from "../component/_generated/component.js";
 import type { Doc, Id } from "../component/_generated/dataModel.js";
 import type { MutationCtx, QueryCtx } from "../component/_generated/server.js";
 import { v } from "convex/values";
-
-type StorageIdAndUrl = { id: Id<"_storage">; url: string };
-
-/**
- * Configuration for a single upload route.
- * @template Metadata - The type returned by checkUpload and passed to onUploaded
- * @template Result - The type returned by onUploaded
- * @template RequireAuth - Whether authentication is required
- */
-export type UploadRouteConfig<
-  Metadata extends Record<string, unknown> = Record<string, unknown>,
-  Result = unknown,
-  RequireAuth extends boolean = false,
-> = {
-  /** Allowed MIME types (supports wildcards like "image/*") */
-  fileTypes: string[];
-  /** Maximum file size in bytes */
-  maxFileSize: number;
-  /** Maximum number of files per upload */
-  maxFileCount?: number;
-  /** Whether to require authentication for the route */
-  requireAuth?: RequireAuth;
-  /**
-   * Called before upload to validate and prepare metadata.
-   * Return value is passed to onUploaded as `metadata`.
-   */
-  checkUpload?: RequireAuth extends true
-    ? (args: {
-        ctx: MutationCtx;
-        identity: UserIdentity;
-      }) => Promise<Metadata> | Metadata
-    : (args: { ctx: MutationCtx }) => Promise<Metadata> | Metadata;
-  /**
-   * Called after files are successfully uploaded.
-   * Return value is sent back to the client.
-   */
-  onUploaded?: RequireAuth extends true
-    ? (args: {
-        ctx: MutationCtx;
-        identity: UserIdentity;
-        storageIdsAndUrls: StorageIdAndUrl[];
-        metadata: Metadata;
-      }) => Promise<Result> | Result
-    : (args: {
-        ctx: MutationCtx;
-        storageIdsAndUrls: StorageIdAndUrl[];
-        metadata: Metadata;
-      }) => Promise<Result> | Result;
-};
-
-/** A collection of named upload routes */
-export type UploadRoutes = Record<
-  string,
-  UploadRouteConfig<any, any, true> | UploadRouteConfig<any, any, false>
->;
-
-type UploadCheckArgs = {
-  route: string;
-  identity?: UserIdentity;
-};
-
-type UploadOnUploadedArgs = {
-  route: string;
-  identity?: UserIdentity;
-  storageIdsAndUrls: StorageIdAndUrl[];
-  metadata: Record<string, unknown>;
-};
-
-type StorageFunctions = {
-  checkUpload: FunctionReference<
-    "mutation",
-    "internal",
-    UploadCheckArgs,
-    Record<string, unknown>
-  >;
-  onUploaded: FunctionReference<
-    "mutation",
-    "internal",
-    UploadOnUploadedArgs,
-    unknown
-  >;
-};
-
-function getAllowedOrigin(request: Request): string {
-  return request.headers.get("Origin") ?? process.env.SITE_URL ?? "*";
-}
-
-function buildCorsHeaders(request: Request): Record<string, string> {
-  const origin = getAllowedOrigin(request);
-  const headers: Record<string, string> = {
-    "Access-Control-Allow-Origin": origin,
-    "Access-Control-Allow-Methods": "POST",
-    "Access-Control-Allow-Headers": "Content-Type, Digest, Authorization",
-    "Access-Control-Max-Age": "86400",
-    Vary: "origin",
-  };
-  if (origin !== "*") {
-    headers["Access-Control-Allow-Credentials"] = "true";
-  }
-  return headers;
-}
-
-function isFile(value: FormDataEntryValue): value is File {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "size" in value &&
-    "type" in value &&
-    "arrayBuffer" in value
-  );
-}
-
-function isMimeTypeAllowed(fileType: string, allowedTypes: string[]): boolean {
-  return allowedTypes.some((allowedType) => {
-    if (allowedType.endsWith("/*")) {
-      const prefix = allowedType.slice(0, -1);
-      return fileType.startsWith(prefix);
-    }
-    return allowedType === fileType;
-  });
-}
-
-function jsonResponse(
-  body: unknown,
-  status: number,
-  corsHeaders?: Record<string, string>,
-): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      "Content-Type": "application/json",
-      ...corsHeaders,
-    },
-  });
-}
-
-function errorResponse(
-  error: string,
-  status: number,
-  corsHeaders?: Record<string, string>,
-): Response {
-  return jsonResponse({ error }, status, corsHeaders);
-}
-
-/**
- * Error class for HTTP errors with status codes.
- */
-class HttpError extends Error {
-  status: number;
-
-  constructor(message: string, status: number) {
-    super(message);
-    this.name = "HttpError";
-    this.status = status;
-  }
-}
-
-async function checkAuth(ctx: GenericActionCtx<any>) {
-  const identity = await ctx.auth.getUserIdentity();
-
-  if (!identity) {
-    throw new HttpError("Unauthorized", 401);
-  }
-
-  return identity;
-}
+import type {
+  StorageFunctions,
+  StorageIdAndUrl,
+  UploadRouteConfig,
+  UploadRoutes,
+} from "./types.js";
+import {
+  buildCorsHeaders,
+  checkAuth,
+  errorResponse,
+  isFile,
+  isMimeTypeAllowed,
+  jsonResponse,
+} from "./utils.js";
+import { HttpError } from "./errors.js";
 
 /**
  * Helper function to define a route with full type inference.
@@ -576,6 +423,3 @@ export function createClient<const Routes extends UploadRoutes>(
     },
   };
 }
-
-// Re-export types for convenience
-export type { StorageIdAndUrl };
