@@ -1,12 +1,12 @@
 {
-  "name": "@example/sample-component",
-  "description": "A sample component component for Convex.",
-  "repository": "github:example-org/sample-component",
-  "homepage": "https://github.com/example-org/sample-component#readme",
+  "name": "better-storage",
+  "description": "A convex component that provides a better way to work with files.",
+  "repository": "github:johannesschiessl/better-storage",
+  "homepage": "https://github.com/johannesschiessl/better-storage#readme",
   "bugs": {
-    "url": "https://github.com/example-org/sample-component/issues"
+    "url": "https://github.com/johannesschiessl/better-storage/issues"
   },
-  "version": "0.1.0",
+  "version": "0.0.0",
   "license": "Apache-2.0",
   "keywords": [
     "convex",

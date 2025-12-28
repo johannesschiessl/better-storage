@@ -3,16 +3,16 @@
 ## Running locally
 
 ```sh
-npm i
-npm run dev
+bun i
+bun run dev
 ```
 
 ## Testing
 
 ```sh
-npm ci
-npm run clean
-npm run typecheck
-npm run lint
-npm run test
+bun ci
+bun run clean
+bun run typecheck
+bun run lint
+bun run test
 ```
